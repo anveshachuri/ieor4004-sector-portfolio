@@ -1,0 +1,2 @@
+lambda,solver_status,status_code,expected_annual_return,annualized_variance,annualized_volatility,weighted_illiquidity,liquidity_penalty,total_objective,sum_weights,full_investment,weights_within_bounds,minimum_return_met,no_short_selling
+0.01,OPTIMAL,2,0.20000000000008145,0.009469531326912535,0.09731151692843214,0.2679649959066364,0.002679649959066364,0.012149181285978899,0.9999999999999647,True,True,True,True
