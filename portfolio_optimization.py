@@ -211,6 +211,10 @@ def solve_portfolio(mu: pd.Series, covariance: pd.DataFrame, q: pd.Series,
         if model.Status == GRB.INF_OR_UNBD:
             model.Params.DualReductions = 0
             model.optimize()
+        if model.Status == GRB.OPTIMAL:
+            print("Optimization status: OPTIMAL")
+        else:
+            print("Solver status:", model.Status)
         statuses = ["LOADED", "OPTIMAL", "INFEASIBLE", "INF_OR_UNBD", "UNBOUNDED",
                     "CUTOFF", "ITERATION_LIMIT", "NODE_LIMIT", "TIME_LIMIT",
                     "SOLUTION_LIMIT", "INTERRUPTED", "NUMERIC", "SUBOPTIMAL",
