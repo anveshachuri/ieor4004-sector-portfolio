@@ -144,11 +144,12 @@ def validate_inputs(mu: pd.Series, covariance: pd.DataFrame, liquidity: pd.DataF
         raise ValueError("Lambda must be finite and nonnegative.")
 
 
-def maximum_feasible_return(mu: pd.Series) -> float:
-    """Greedily allocate to highest mu under the fixed cap, for diagnostics."""
+def maximum_feasible_return(mu: pd.Series, c_max: float | None = None) -> float:
+    """Greedily allocate to highest mu under the sector cap, for diagnostics."""
+    c_max = C_MAX if c_max is None else c_max
     remaining, maximum = 1.0, 0.0
     for expected_return in mu.sort_values(ascending=False):
-        weight = min(C_MAX, remaining)
+        weight = min(c_max, remaining)
         maximum += weight * expected_return
         remaining -= weight
     if remaining > TOL:
@@ -156,39 +157,63 @@ def maximum_feasible_return(mu: pd.Series) -> float:
     return float(maximum)
 
 
-def constraint_checks(weights: np.ndarray, mu: np.ndarray) -> dict[str, bool]:
+def constraint_checks(weights: np.ndarray, mu: np.ndarray,
+                      r_min: float | None = None, c_max: float | None = None) -> dict[str, bool]:
     """Verify the original four constraint groups at tolerance 1e-6."""
+    r_min = R_MIN if r_min is None else r_min
+    c_max = C_MAX if c_max is None else c_max
     return {
         "full_investment": bool(abs(weights.sum() - 1) <= TOL),
-        "weights_within_bounds": bool(((weights >= -TOL) & (weights <= C_MAX + TOL)).all()),
-        "minimum_return_met": bool(mu @ weights >= R_MIN - TOL),
+        "weights_within_bounds": bool(((weights >= -TOL) & (weights <= c_max + TOL)).all()),
+        "minimum_return_met": bool(mu @ weights >= r_min - TOL),
         "no_short_selling": bool((weights >= -TOL).all()),
     }
 
 
-def report_infeasibility(model: gp.Model, mu: pd.Series, root: Path) -> None:
-    """Report the return/cap conflict and Gurobi's irreducible infeasible set."""
-    maximum = maximum_feasible_return(mu)
-    print(f"INFEASIBLE: required return {R_MIN:.2%}; cap-implied maximum {maximum:.4%}.")
-    print("Check the decimal return units, estimation window, full investment and 20% caps.")
-    if maximum < R_MIN - TOL:
-        print("The 20% return target exceeds the maximum return allowed by the sector caps.")
+def report_infeasibility(model: gp.Model, mu: pd.Series, root: Path | None,
+                         r_min: float, c_max: float) -> str:
+    """Explain mathematical conflicts; use IIS for unexplained infeasibility."""
+    explanation = ""
+    if len(SECTORS) * c_max < 1:
+        explanation = (f"{len(SECTORS)} * C_max = {len(SECTORS) * c_max:.6f} < 1: "
+                       "full investment is impossible without exceeding ETF caps.")
+    else:
+        maximum = maximum_feasible_return(mu, c_max)
+        if r_min > maximum:
+            explanation = (f"Required return {r_min:.6%} exceeds the maximum achievable return "
+                           f"{maximum:.6%} under the {c_max:.2%} sector cap; "
+                           f"gap = {100 * (r_min - maximum):.6f} percentage points.")
+    if explanation and root is None:
+        return explanation
     try:
         model.computeIIS()
         conflicts = [c.ConstrName for c in model.getConstrs() if c.IISConstr]
-        conflicts += [f"{v.VarName}: lower bound" for v in model.getVars() if v.IISLB]
-        conflicts += [f"{v.VarName}: upper bound" for v in model.getVars() if v.IISUB]
-        print("Conflicting constraints/bounds:", ", ".join(conflicts))
-        model.write(str(root / "portfolio_infeasibility.ilp"))
+        conflicts += [f"{v.VarName} >= {v.LB:g}" for v in model.getVars() if v.IISLB]
+        conflicts += [f"{v.VarName} <= {v.UB:g}" for v in model.getVars() if v.IISUB]
+        if conflicts:
+            explanation += (" IIS: these constraints/bounds cannot hold together: "
+                            + ", ".join(conflicts) + ".")
+        else:
+            explanation += " IIS diagnosis was inconclusive; no cause could be established."
+        if root is not None:
+            model.write(str(root / "portfolio_infeasibility.ilp"))
     except gp.GurobiError as error:
-        print(f"Gurobi could not compute IIS diagnostics: {error}")
+        explanation += f" IIS diagnosis unavailable: {error}; no further cause established."
+    return explanation.strip()
 
 
 def solve_portfolio(mu: pd.Series, covariance: pd.DataFrame, q: pd.Series,
-                    env: gp.Env, root: Path) -> dict:
-    """Solve one fixed-lambda convex QP; access weights only after OPTIMAL."""
-    if not np.isfinite(LAMBDA) or LAMBDA < 0:
+                    env: gp.Env, root: Path | None, *, lambda_: float | None = None,
+                    r_min: float | None = None, c_max: float | None = None,
+                    verbose: bool = True) -> dict:
+    """Solve the convex QP; default parameters reproduce the standalone baseline."""
+    lambda_ = LAMBDA if lambda_ is None else lambda_
+    r_min = R_MIN if r_min is None else r_min
+    c_max = C_MAX if c_max is None else c_max
+    if not np.isfinite(lambda_) or lambda_ < 0:
         raise ValueError("Lambda must be finite and nonnegative (an input, not a constraint).")
+    if not np.isfinite(r_min) or not np.isfinite(c_max) or c_max < 0:
+        raise ValueError("Return target and sector cap must be finite; cap must be nonnegative.")
     with gp.Model("sector_portfolio", env=env) as model:
         model.Params.FeasibilityTol = 1e-9
         model.Params.OptimalityTol = 1e-9
@@ -196,35 +221,42 @@ def solve_portfolio(mu: pd.Series, covariance: pd.DataFrame, q: pd.Series,
 
         # Constraints 3 and 4: sector caps and no shorts are variable bounds.
         # Exactly 11 continuous weights; no liquidity or lambda variables.
-        w = model.addVars(SECTORS, lb=0.0, ub=C_MAX, vtype=GRB.CONTINUOUS, name="w")
+        w = model.addVars(SECTORS, lb=0.0, ub=c_max, vtype=GRB.CONTINUOUS, name="w")
         variance = gp.quicksum(
             float(covariance.loc[i, j]) * w[i] * w[j] for i in SECTORS for j in SECTORS
         )
         illiquidity = gp.quicksum(float(q[i]) * w[i] for i in SECTORS)
-        model.setObjective(variance + LAMBDA * illiquidity, GRB.MINIMIZE)
+        model.setObjective(variance + lambda_ * illiquidity, GRB.MINIMIZE)
         # Constraint 1: full investment. Dollar allocations are BUDGET * w_i.
         model.addConstr(gp.quicksum(w[i] for i in SECTORS) == 1.0, name="full_investment")
         # Constraint 2: required expected annual return, in decimal units.
-        model.addConstr(gp.quicksum(float(mu[i]) * w[i] for i in SECTORS) >= R_MIN,
+        model.addConstr(gp.quicksum(float(mu[i]) * w[i] for i in SECTORS) >= r_min,
                         name="minimum_expected_return")
         model.optimize()
         if model.Status == GRB.INF_OR_UNBD:
             model.Params.DualReductions = 0
             model.optimize()
-        if model.Status == GRB.OPTIMAL:
-            print("Optimization status: OPTIMAL")
-        else:
-            print("Solver status:", model.Status)
+        if model.Status in (GRB.SUBOPTIMAL, GRB.NUMERIC):
+            # Simplex can resolve numerical trouble in barrier's infeasibility search.
+            model.reset()
+            model.Params.Method = 1
+            model.Params.DualReductions = 0
+            model.optimize()
         statuses = ["LOADED", "OPTIMAL", "INFEASIBLE", "INF_OR_UNBD", "UNBOUNDED",
                     "CUTOFF", "ITERATION_LIMIT", "NODE_LIMIT", "TIME_LIMIT",
                     "SOLUTION_LIMIT", "INTERRUPTED", "NUMERIC", "SUBOPTIMAL",
                     "INPROGRESS", "USER_OBJ_LIMIT", "WORK_LIMIT", "MEM_LIMIT"]
         status = next((s for s in statuses if getattr(GRB, s) == model.Status), str(model.Status))
-        result = {"lambda": LAMBDA, "solver_status": status, "status_code": model.Status}
+        result = {"lambda": lambda_, "solver_status": status, "status_code": model.Status}
+        if verbose:
+            print(f"Optimization status: {status}")
         if model.Status != GRB.OPTIMAL:
-            print(f"Solver status: {status}; no optimal allocation will be reported.")
             if model.Status == GRB.INFEASIBLE:
-                report_infeasibility(model, mu, root)
+                result["explanation"] = report_infeasibility(model, mu, root, r_min, c_max)
+            else:
+                result["explanation"] = f"Solver stopped with {status}; no proven optimal solution."
+            if verbose:
+                print(result["explanation"])
             return result
 
         weights = np.array([w[i].X for i in SECTORS])
@@ -234,7 +266,7 @@ def solve_portfolio(mu: pd.Series, covariance: pd.DataFrame, q: pd.Series,
         if annual_variance < -1e-12:
             raise ValueError("Computed negative portfolio variance.")
         weighted_illiquidity = float(q.to_numpy() @ weights)
-        liquidity_penalty = LAMBDA * weighted_illiquidity
+        liquidity_penalty = lambda_ * weighted_illiquidity
         result.update({
             "expected_annual_return": annual_return,
             "annualized_variance": annual_variance,
@@ -243,7 +275,7 @@ def solve_portfolio(mu: pd.Series, covariance: pd.DataFrame, q: pd.Series,
             "liquidity_penalty": liquidity_penalty,
             "total_objective": annual_variance + liquidity_penalty,
             "sum_weights": float(weights.sum()),
-            **constraint_checks(weights, mu.to_numpy()),
+            **constraint_checks(weights, mu.to_numpy(), r_min, c_max),
             **{f"weight_{i}": weight for i, weight in zip(SECTORS, weights)},
         })
         if not np.isclose(result["total_objective"], model.ObjVal, rtol=1e-8, atol=1e-10):
