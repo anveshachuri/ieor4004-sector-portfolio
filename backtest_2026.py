@@ -3,7 +3,7 @@
 Run: python backtest_2026.py (with the project's virtual environment active).
 Requires matplotlib in addition to the existing model dependencies.
 
-Evaluation window: first trading day of 2026 through the last date in the data file.
+Evaluation window: first trading day of 2026 through September 30, 2026.
 Rebalancing rules compared (this specifies the "2026 evaluation rebalancing"):
   1. Buy & hold        - Milestone 4 weights (fit on 2024-2025), bought at the
                          2025-12-31 close and never traded again; weights drift.
@@ -109,7 +109,7 @@ def stats(daily: pd.Series, rf: pd.Series, turnover: float | None) -> dict:
 
 def main() -> int:
     adj, dollar_volume, rf = load_data()
-    daily = adj.pct_change(fill_method=None).loc[START:]
+    daily = adj.pct_change(fill_method=None).loc[START:"2026-09-30"]
     sector_returns = daily[p.SECTORS]
     rebalance_days = first_trading_days_of_quarters(daily.index)
     print(f"Evaluation window: {daily.index[0].date()} to {daily.index[-1].date()} "
